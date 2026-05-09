@@ -1,0 +1,6 @@
+playwright
+pytest-playwright
+pytesseract
+Pillow
+python-dotenv
+script-reporter

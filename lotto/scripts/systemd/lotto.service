@@ -1,0 +1,20 @@
+[Unit]
+Description=Lotto Auto Purchase Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={{PROJECT_ROOT}}
+Environment="PATH={{PROJECT_ROOT}}/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Run main workflow script
+ExecStart={{PROJECT_ROOT}}/scripts/run.sh
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lotto-auto
+
+[Install]
+WantedBy=default.target
