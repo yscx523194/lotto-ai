@@ -2,9 +2,7 @@
 .env
 lotto/.env
 
-# 캐시/모델 (용량 큼, 재생성 가능)
-models/
-models_v2/
+# 캐시
 __pycache__/
 *.pyc
 
