@@ -5,8 +5,11 @@ async function request(path, options = {}) {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || '요청 실패');
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = null; }
+  if (!res.ok) throw new Error(data?.error || `요청 실패 (${res.status})`);
+  if (!data) throw new Error('서버 응답이 비어있습니다.');
   return data;
 }
 
@@ -45,4 +48,20 @@ export function getRestriction() {
 
 export function getPrediction() {
   return request('/prediction');
+}
+
+export function refreshLatest() {
+  return request('/latest/refresh', { method: 'POST' });
+}
+
+export function refreshPrediction() {
+  return request('/prediction/refresh', { method: 'POST' });
+}
+
+export function getModelStatus() {
+  return request('/model/status');
+}
+
+export function trainModel() {
+  return request('/model/train', { method: 'POST' });
 }

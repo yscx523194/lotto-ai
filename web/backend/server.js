@@ -37,7 +37,7 @@ function writeHistory(data) {
 }
 
 function runPython(script, args = []) {
-  return execFileAsync('python3', [script, ...args], {
+  return execFileAsync('python', [script, ...args], {
     cwd: LOTTO_SRC,
     timeout: 120_000,
     env: { ...process.env, HEADLESS: 'true' },
@@ -134,14 +134,14 @@ app.post('/api/purchase', async (req, res) => {
     const envPath = join(LOTTO_ROOT, 'lotto', '.env');
     writeFileSync(envPath, `USER_ID=${userId}\nPASSWD=${password}\n`);
 
-    // 1. Generate predictions
-    const purchaseGamesPath = join(LOTTO_ROOT, 'models_v2', 'purchase_games.json');
+    // 1. Load predictions from lotto_models/meta.json
+    const metaPath = join(LOTTO_ROOT, 'lotto_models', 'meta.json');
     let games;
-    if (existsSync(purchaseGamesPath)) {
-      const saved = JSON.parse(readFileSync(purchaseGamesPath, 'utf-8'));
-      games = saved.games;
+    if (existsSync(metaPath)) {
+      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      games = meta.games;
     } else {
-      return res.status(500).json({ error: '예측 모델이 준비되지 않았습니다. git pull을 실행하세요.' });
+      return res.status(500).json({ error: '예측 모델이 준비되지 않았습니다. 학습을 먼저 진행하세요.' });
     }
 
     // 2. Run purchase via lotto645.py
@@ -202,6 +202,65 @@ app.get('/api/latest', (_req, res) => {
   }
 });
 
+// Refresh winning numbers from dhlottery API
+app.post('/api/latest/refresh', async (_req, res) => {
+  try {
+    // 캐시에서 최신 회차 확인 후 그 다음 회차부터 가져오기
+    const script = `
+import sys, json
+sys.path.insert(0, r"${LOTTO_ROOT.replace(/\\/g, '\\\\')}")
+from lotto import create_session, fetch_batch, load_cache, save_cache
+cache = load_cache()
+max_round = max(int(k) for k in cache.keys()) if cache else 0
+s = create_session()
+items = fetch_batch(s, "center", max_round + 1)
+added = 0
+for item in items:
+    key = str(item["\\ud68c\\ucc28"])
+    if key not in cache:
+        cache[key] = item
+        added += 1
+if added > 0:
+    save_cache(cache)
+print(json.dumps({"added": added, "latest": max(int(k) for k in cache.keys())}, ensure_ascii=False))
+`.trim();
+    const { stdout } = await execFileAsync('python', ['-c', script], {
+      cwd: LOTTO_ROOT,
+      timeout: 30_000,
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+    });
+
+    const cache = JSON.parse(readFileSync(CACHE_FILE, 'utf-8'));
+    const entries = Object.values(cache).sort((a, b) => b['회차'] - a['회차']);
+    const latest = entries.slice(0, 10);
+    res.json(latest);
+  } catch (err) {
+    console.error('Refresh latest error:', err.message);
+    res.status(500).json({ error: '당첨번호 갱신 중 오류가 발생했습니다.' });
+  }
+});
+
+// Refresh prediction using saved model (predict_fast.py)
+app.post('/api/prediction/refresh', async (_req, res) => {
+  try {
+    const { stdout } = await execFileAsync('python', [
+      '-c',
+      'import sys, json; sys.path.insert(0, r"' + LOTTO_ROOT.replace(/\\/g, '\\\\') + '"); from predict_fast import predict; r = predict(); print("__RESULT__", json.dumps(r, ensure_ascii=False))',
+    ], { cwd: LOTTO_ROOT, timeout: 30_000 });
+
+    const match = stdout.match(/__RESULT__\s*({.*})/);
+    if (match) {
+      const result = JSON.parse(match[1]);
+      res.json({ games: result });
+    } else {
+      res.status(500).json({ error: '예측 결과를 파싱할 수 없습니다.' });
+    }
+  } catch (err) {
+    console.error('Refresh prediction error:', err.message);
+    res.status(500).json({ error: '재예측 중 오류가 발생했습니다.' });
+  }
+});
+
 // Purchase restriction info
 app.get('/api/restriction', (_req, res) => {
   res.json(getPurchaseRestriction());
@@ -210,6 +269,18 @@ app.get('/api/restriction', (_req, res) => {
 // Prediction info
 app.get('/api/prediction', (_req, res) => {
   try {
+    const metaPath = join(LOTTO_ROOT, 'lotto_models', 'meta.json');
+    if (existsSync(metaPath)) {
+      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      return res.json({
+        games: {
+          target_round: meta.target_round,
+          games: meta.games || [],
+          trained_on: meta.trained_on,
+        }
+      });
+    }
+    // fallback: legacy models_v2
     const predPath = join(LOTTO_ROOT, 'models_v2', 'prediction_v2.json');
     const gamesPath = join(LOTTO_ROOT, 'models_v2', 'purchase_games.json');
     const result = {};
@@ -222,6 +293,61 @@ app.get('/api/prediction', (_req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: '예측 데이터 조회 실패' });
+  }
+});
+
+// Model status: check if model needs re-training
+app.get('/api/model/status', (_req, res) => {
+  try {
+    const metaPath = join(LOTTO_ROOT, 'lotto_models', 'meta.json');
+    if (!existsSync(metaPath)) {
+      return res.json({ hasModel: false, needsTraining: true, trainedOn: 0, targetRound: 0, latestRound: 0 });
+    }
+    const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+    let latestRound = meta.trained_on;
+    if (existsSync(CACHE_FILE)) {
+      const cache = JSON.parse(readFileSync(CACHE_FILE, 'utf-8'));
+      latestRound = Math.max(...Object.keys(cache).map(Number));
+    }
+    const needsTraining = meta.trained_on < latestRound;
+    res.json({
+      hasModel: true,
+      needsTraining,
+      trainedOn: meta.trained_on,
+      targetRound: meta.target_round,
+      latestRound,
+    });
+  } catch (err) {
+    res.status(500).json({ error: '모델 상태 확인 실패' });
+  }
+});
+
+// Train model
+app.post('/api/model/train', async (_req, res) => {
+  try {
+    const { stdout } = await execFileAsync('python', [
+      join(LOTTO_ROOT, 'train_model.py'),
+    ], {
+      cwd: LOTTO_ROOT,
+      timeout: 300_000,
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+    });
+    // After training, return fresh prediction
+    const metaPath = join(LOTTO_ROOT, 'lotto_models', 'meta.json');
+    const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+    res.json({
+      success: true,
+      trainedOn: meta.trained_on,
+      targetRound: meta.target_round,
+      games: {
+        target_round: meta.target_round,
+        games: meta.games || [],
+        trained_on: meta.trained_on,
+      },
+    });
+  } catch (err) {
+    console.error('Train error:', err.message);
+    res.status(500).json({ error: '모델 학습 중 오류가 발생했습니다.' });
   }
 });
 

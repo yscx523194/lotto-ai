@@ -31,13 +31,15 @@ MODEL_DIR = os.path.join(BASE_DIR, "lotto_models")
 # 조합 점수 + 필터 (학습 불필요, 순수 계산)
 # ════════════════════════════════════════════════════════════
 
-def _score_combination(combo, struct_pred):
+def _score_combination(combo, struct_pred, prev_nums=None, streaks=None):
+    """조합 점수 평가 (하드/소프트 필터 + 구조예측)"""
     nums = sorted(combo)
     total_sum = sum(nums)
     odd_count = sum(1 for n in nums if n % 2 == 1)
     consec_count = sum(1 for i in range(5) if nums[i + 1] - nums[i] == 1)
     high_count = sum(1 for n in nums if n >= 23)
     has_triple = any(nums[i+1] - nums[i] == 1 and nums[i+2] - nums[i+1] == 1 for i in range(4))
+    gaps = [nums[i+1] - nums[i] for i in range(5)]
 
     diffs = set()
     for i in range(6):
@@ -50,6 +52,7 @@ def _score_combination(combo, struct_pred):
     endings = [n % 10 for n in nums]
     max_same_ending = max(Counter(endings).values())
     unique_endings = len(set(endings))
+    ending_sum = sum(endings)
 
     decades = [0] * 5
     for n in nums:
@@ -62,9 +65,12 @@ def _score_combination(combo, struct_pred):
     span = nums[5] - nums[0]
     has_quad = any(nums[i+1]-nums[i]==1 and nums[i+2]-nums[i+1]==1 and nums[i+3]-nums[i+2]==1 for i in range(3))
     mult3_count = sum(1 for n in nums if n % 3 == 0)
+    mult5_count = sum(1 for n in nums if n % 5 == 0)
     max_decade = max(decades)
+    min_gap = min(gaps)
+    gap_cv = np.std(gaps) / np.mean(gaps) if np.mean(gaps) > 0 else 0
 
-    # 하드 필터 (데이터 분석 기반 — 출현율 5% 미만)
+    # ── 하드 필터 ──
     if total_sum < 90 or total_sum > 200: return -100.0
     if odd_count <= 0 or odd_count >= 6: return -100.0
     if ac_value <= 4: return -100.0
@@ -75,8 +81,19 @@ def _score_combination(combo, struct_pred):
     if high_count == 0 or high_count == 6: return -100.0
     if nums[0] >= 15: return -100.0
     if nums[5] <= 35: return -100.0
+    if max_decade >= 5: return -100.0
+    if min_gap >= 5: return -100.0
+    if ending_sum <= 10: return -100.0
 
-    # 소프트 필터 (감점)
+    if prev_nums is not None:
+        carry_count = len(set(nums) & set(prev_nums))
+        if carry_count >= 4: return -100.0
+
+    if streaks is not None:
+        hot_streak_count = sum(1 for n in nums if streaks.get(n, 0) >= 4)
+        if hot_streak_count >= 2: return -100.0
+
+    # ── 소프트 필터 ──
     log_prob = 0.0
     if has_triple: log_prob -= 1.5
     if odd_count == 1 or odd_count == 5: log_prob -= 0.5
@@ -84,8 +101,21 @@ def _score_combination(combo, struct_pred):
     if max_decade >= 4: log_prob -= 1.0
     if unique_endings <= 3: log_prob -= 1.0
     if mult3_count == 0 or mult3_count >= 5: log_prob -= 0.5
+    if mult5_count >= 4: log_prob -= 0.8
     if total_sum < 100 or total_sum > 170: log_prob -= 0.3
+    if gap_cv < 0.3: log_prob -= 0.8
+    if ending_sum >= 40: log_prob -= 0.5
 
+    if prev_nums is not None:
+        carry_count = len(set(nums) & set(prev_nums))
+        if carry_count >= 3: log_prob -= 0.8
+
+    if streaks is not None:
+        streak_3_count = sum(1 for n in nums if streaks.get(n, 0) >= 3)
+        if streak_3_count >= 2: log_prob -= 0.5
+        if streak_3_count >= 3: log_prob -= 1.0
+
+    # ── 구조 예측 z-score ──
     checks = {
         "sum": total_sum, "odd_count": odd_count, "high_count": high_count,
         "consec_count": consec_count, "ac_value": ac_value,
@@ -103,9 +133,9 @@ def _score_combination(combo, struct_pred):
     return log_prob
 
 
-def _partition_into_5_games(pool_30, struct_pred, n_attempts=30, n_candidates=100):
-    """30개 번호를 5게임(6개씩)으로 최적 분할 (경량 버전)"""
-    pool = list(pool_30)
+def _partition_into_5_games(pool, struct_pred, prev_nums=None, streaks=None, n_attempts=30, n_candidates=100):
+    """풀 번호를 5게임(6개씩)으로 최적 분할 (경량 버전)"""
+    pool = list(pool)
     best_partition = None
     best_total_score = -999
 
@@ -113,15 +143,18 @@ def _partition_into_5_games(pool_30, struct_pred, n_attempts=30, n_candidates=10
         partition = []
         remaining = list(pool)
         np.random.shuffle(remaining)
+        # 풀이 30개 초과면 셔플 후 30개만 사용
+        if len(remaining) > 30:
+            remaining = remaining[:30]
         total_score = 0
 
         for game_idx in range(5):
             if len(remaining) < 6:
                 break
             if game_idx == 4:
-                combo = sorted(remaining)
+                combo = sorted(remaining[:6])
                 partition.append(combo)
-                total_score += _score_combination(tuple(combo), struct_pred)
+                total_score += _score_combination(tuple(combo), struct_pred, prev_nums, streaks)
                 remaining = []
             else:
                 best_combo, best_sc = None, -999
@@ -137,7 +170,7 @@ def _partition_into_5_games(pool_30, struct_pred, n_attempts=30, n_candidates=10
                     candidates = list(candidates)
 
                 for combo in candidates:
-                    sc = _score_combination(tuple(combo), struct_pred)
+                    sc = _score_combination(tuple(combo), struct_pred, prev_nums, streaks)
                     if sc > best_sc:
                         best_sc = sc
                         best_combo = list(combo)
@@ -150,7 +183,7 @@ def _partition_into_5_games(pool_30, struct_pred, n_attempts=30, n_candidates=10
                 else:
                     combo = sorted(remaining[:6])
                     partition.append(combo)
-                    total_score += _score_combination(tuple(combo), struct_pred)
+                    total_score += _score_combination(tuple(combo), struct_pred, prev_nums, streaks)
                     remaining = remaining[6:]
 
         if len(partition) == 5 and total_score > best_total_score:
@@ -179,7 +212,7 @@ def predict(model_dir: str = None) -> dict:
         {
             "target_round": 1224,
             "games": [[1,2,3,4,5,6], ...],  # 5게임
-            "pool_30": [...],
+            "pool_35": [...],
             "excluded_15": [...],
             "cold_in_pool": 15,
             "model_trained_on": 1223,
@@ -201,17 +234,19 @@ def predict(model_dir: str = None) -> dict:
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    pool_30 = meta["pool_30"]
+    pool = meta.get("pool_35", meta.get("pool_30", []))
     struct_pred = meta["struct_pred"]
+    prev_nums = meta.get("prev_nums")
+    streaks = {int(k): v for k, v in meta.get("streaks", {}).items()}
 
     # 5게임 분할 (매번 다른 조합 — 같은 풀에서 새로운 파티션)
-    games = _partition_into_5_games(pool_30, struct_pred)
+    games = _partition_into_5_games(pool, struct_pred, prev_nums, streaks)
 
     return {
         "target_round": meta["target_round"],
         "games": games,
-        "pool_30": pool_30,
-        "excluded_15": meta["excluded_15"],
+        "pool_35": pool,
+        "excluded_10": meta.get("excluded_10", meta.get("excluded_15", [])),
         "cold_in_pool": meta["cold_in_pool"],
         "model_trained_on": meta["trained_on"],
         "scores": meta.get("scores"),
@@ -236,8 +271,8 @@ if __name__ == "__main__":
         output = {
             "target_round": result["target_round"],
             "games": result["games"],
-            "pool_30": result["pool_30"],
-            "excluded_15": result["excluded_15"],
+            "pool_35": result["pool_35"],
+            "excluded_10": result["excluded_10"],
             "cold_in_pool": result["cold_in_pool"],
             "model_trained_on": result["model_trained_on"],
             "elapsed_ms": round(elapsed * 1000),
@@ -248,8 +283,8 @@ if __name__ == "__main__":
         print(f"\n{'=' * 60}")
         print(f"  {result['target_round']}회차 예측 (최대 커버리지)")
         print(f"{'=' * 60}")
-        print(f"\n  풀 30개: {result['pool_30']}")
-        print(f"  제외 15개: {result['excluded_15']}")
+        print(f"\n  풀 35개: {result['pool_35']}")
+        print(f"  제외 10개: {result['excluded_10']}")
         print(f"  cold 포함: {result['cold_in_pool']}개")
         print(f"\n  5게임:")
         for i, g in enumerate(result["games"], 1):

@@ -333,13 +333,31 @@ def predict_transformer(model, binary_matrix, target_idx, seq_len=30):
 # 조합 점수 + 필터
 # ════════════════════════════════════════════════════════════
 
-def score_combination(combo, struct_pred):
+def build_pair_scores(df, train_end):
+    """페어 동시출현 빈도 → z-score 매트릭스 (45×45)"""
+    pair_count = np.zeros((45, 45), dtype=np.float64)
+    for idx in range(train_end):
+        row = df.iloc[idx]
+        nums = [int(row[c]) - 1 for c in ["n1", "n2", "n3", "n4", "n5", "n6"]]
+        for i in range(6):
+            for j in range(i + 1, 6):
+                pair_count[nums[i], nums[j]] += 1
+                pair_count[nums[j], nums[i]] += 1
+    expected = train_end * 2 * (5 / 44)  # 한 번호가 나왔을 때 특정 번호와 페어될 기대값
+    std = np.sqrt(expected * (1 - 5/44))
+    pair_z = (pair_count - expected) / max(std, 0.1)
+    return pair_z
+
+
+def score_combination(combo, struct_pred, pair_z=None, prev_nums=None, streaks=None):
+    """조합 점수 평가 (하드/소프트 필터 + 구조예측 + 페어점수)"""
     nums = sorted(combo)
     total_sum = sum(nums)
     odd_count = sum(1 for n in nums if n % 2 == 1)
     consec_count = sum(1 for i in range(5) if nums[i + 1] - nums[i] == 1)
     high_count = sum(1 for n in nums if n >= 23)
     has_triple = any(nums[i+1] - nums[i] == 1 and nums[i+2] - nums[i+1] == 1 for i in range(4))
+    gaps = [nums[i+1] - nums[i] for i in range(5)]
 
     diffs = set()
     for i in range(6):
@@ -352,6 +370,7 @@ def score_combination(combo, struct_pred):
     endings = [n % 10 for n in nums]
     max_same_ending = max(Counter(endings).values())
     unique_endings = len(set(endings))
+    ending_sum = sum(endings)
 
     decades = [0] * 5
     for n in nums:
@@ -364,9 +383,12 @@ def score_combination(combo, struct_pred):
     span = nums[5] - nums[0]
     has_quad = any(nums[i+1]-nums[i]==1 and nums[i+2]-nums[i+1]==1 and nums[i+3]-nums[i+2]==1 for i in range(3))
     mult3_count = sum(1 for n in nums if n % 3 == 0)
+    mult5_count = sum(1 for n in nums if n % 5 == 0)
     max_decade = max(decades)
+    min_gap = min(gaps)
+    gap_cv = np.std(gaps) / np.mean(gaps) if np.mean(gaps) > 0 else 0
 
-    # 하드 필터 (데이터 분석 기반 — 출현율 5% 미만)
+    # ── 하드 필터 (출현율 5% 미만 → 즉시 제거) ──
     if total_sum < 90 or total_sum > 200: return -100.0      # 7.9%
     if odd_count <= 0 or odd_count >= 6: return -100.0       # 2.9%
     if ac_value <= 4: return -100.0                          # 2.5%
@@ -377,17 +399,45 @@ def score_combination(combo, struct_pred):
     if high_count == 0 or high_count == 6: return -100.0     # 2.6% (올고/올저)
     if nums[0] >= 15: return -100.0                          # 9.4% (최소번호 15+)
     if nums[5] <= 35: return -100.0                          # 19.6% (최대번호 35-)
+    if max_decade >= 5: return -100.0                        # 0.4% (한구간 5개+)
+    if min_gap >= 5: return -100.0                           # 2.9% (모든 번호가 너무 흩어짐)
+    if ending_sum <= 10: return -100.0                       # 0.8% (끝수합 극단)
 
-    # 소프트 필터 (감점)
+    # 이월 필터 (이전 회차에서 4개+ 재출현 = 0.2%)
+    if prev_nums is not None:
+        carry_count = len(set(nums) & set(prev_nums))
+        if carry_count >= 4: return -100.0
+
+    # 연속출현 필터 (4연속 출현 번호가 2개+ 포함 = 극히 드묾)
+    if streaks is not None:
+        hot_streak_count = sum(1 for n in nums if streaks.get(n, 0) >= 4)
+        if hot_streak_count >= 2: return -100.0
+
+    # ── 소프트 필터 (감점) ──
     log_prob = 0.0
     if has_triple: log_prob -= 1.5                           # 5.4% (3연번)
     if odd_count == 1 or odd_count == 5: log_prob -= 0.5     # 14.7%
     if consec_count >= 3: log_prob -= 1.0                    # 1.8%
-    if max_decade >= 4: log_prob -= 1.0                      # 5.8% (한 구간 4개+)
+    if max_decade >= 4: log_prob -= 1.0                      # 5.8% (한구간 4개+)
     if unique_endings <= 3: log_prob -= 1.0                  # 3.8%
     if mult3_count == 0 or mult3_count >= 5: log_prob -= 0.5 # 8.4%
+    if mult5_count >= 4: log_prob -= 0.8                     # 0.7% (5배수 4개+)
     if total_sum < 100 or total_sum > 170: log_prob -= 0.3   # 26.8% (타이트 범위)
+    if gap_cv < 0.3: log_prob -= 0.8                         # 3.0% (등간격)
+    if ending_sum >= 40: log_prob -= 0.5                     # 2.1%
 
+    # 이월 소프트 (3개 재출현 = 2%)
+    if prev_nums is not None:
+        carry_count = len(set(nums) & set(prev_nums))
+        if carry_count >= 3: log_prob -= 0.8
+
+    # 연속출현 소프트 (3연속 출현 번호 포함)
+    if streaks is not None:
+        streak_3_count = sum(1 for n in nums if streaks.get(n, 0) >= 3)
+        if streak_3_count >= 2: log_prob -= 0.5
+        if streak_3_count >= 3: log_prob -= 1.0
+
+    # ── 구조 예측 z-score ──
     checks = {
         "sum": total_sum, "odd_count": odd_count, "high_count": high_count,
         "consec_count": consec_count, "ac_value": ac_value,
@@ -402,6 +452,17 @@ def score_combination(combo, struct_pred):
             z = (actual_val - pred) / std
             log_prob -= 0.5 * z * z
 
+    # ── 페어 동시출현 점수 ──
+    if pair_z is not None:
+        pair_score = 0.0
+        count = 0
+        idxs = [n - 1 for n in nums]
+        for i in range(6):
+            for j in range(i + 1, 6):
+                pair_score += pair_z[idxs[i], idxs[j]]
+                count += 1
+        log_prob += 0.05 * pair_score / count  # 약한 가중 (데이터 노이즈 방지)
+
     return log_prob
 
 
@@ -410,20 +471,10 @@ def score_combination(combo, struct_pred):
 # ════════════════════════════════════════════════════════════
 
 def apply_adjustments(scores, df, total):
+    """점수 조정 (스트릭 감쇠 제거 — 실험 결과 효과 없음)"""
     adjusted = scores.copy()
-    for num in range(1, 46):
-        streak = 0
-        for t in range(total - 1, -1, -1):
-            row = df.iloc[t]
-            if num in [row["n1"], row["n2"], row["n3"],
-                       row["n4"], row["n5"], row["n6"]]:
-                streak += 1
-            else:
-                break
-        if streak >= 4: adjusted[num - 1] *= 0.3
-        elif streak >= 3: adjusted[num - 1] *= 0.6
-
-    # cold pool (최근 5회 미출현)
+    # 스트릭 감쇠 제거: Round 1 실험에서 K_no_cold(감쇠 없음)이 2위
+    # cold pool은 참고용으로만 계산
     recent_5 = set()
     for t in range(max(0, total - 5), total):
         row = df.iloc[t]
@@ -434,26 +485,16 @@ def apply_adjustments(scores, df, total):
     return adjusted, cold_pool
 
 
-def select_pool_30(adjusted, cold_pool):
+def select_pool_35(adjusted, cold_pool):
+    """상위 35개 번호 선정 (cold 강제 없음 — 실험 결과 성능 저하)"""
     sorted_indices = np.argsort(adjusted)[::-1]
-    pool_30 = set(int(idx + 1) for idx in sorted_indices[:30])
-
-    cold_in_pool = pool_30 & cold_pool
-    if len(cold_in_pool) < 8:
-        cold_ranked = sorted(cold_pool - pool_30,
-                             key=lambda n: adjusted[n - 1], reverse=True)
-        hot_ranked = sorted(pool_30 - cold_pool,
-                            key=lambda n: adjusted[n - 1])
-        needed = 8 - len(cold_in_pool)
-        for i in range(min(needed, len(cold_ranked), len(hot_ranked))):
-            pool_30.discard(hot_ranked[i])
-            pool_30.add(cold_ranked[i])
-
-    return sorted(pool_30)
+    pool = sorted(int(idx + 1) for idx in sorted_indices[:35])
+    return pool
 
 
-def partition_into_5_games(pool_30, struct_pred, n_attempts=200, n_candidates=500):
-    pool = list(pool_30)
+def partition_into_5_games(pool, struct_pred, pair_z=None, prev_nums=None, streaks=None, n_attempts=200, n_candidates=500):
+    """풀 번호를 5게임(6개씩)으로 최적 분할"""
+    pool = list(pool)
     best_partition = None
     best_total_score = -999
 
@@ -461,15 +502,18 @@ def partition_into_5_games(pool_30, struct_pred, n_attempts=200, n_candidates=50
         partition = []
         remaining = list(pool)
         np.random.shuffle(remaining)
+        # 풀이 30개 초과면 셔플 후 30개만 사용
+        if len(remaining) > 30:
+            remaining = remaining[:30]
         total_score = 0
 
         for game_idx in range(5):
             if len(remaining) < 6:
                 break
             if game_idx == 4:
-                combo = sorted(remaining)
+                combo = sorted(remaining[:6])
                 partition.append(combo)
-                total_score += score_combination(tuple(combo), struct_pred)
+                total_score += score_combination(tuple(combo), struct_pred, pair_z, prev_nums, streaks)
                 remaining = []
             else:
                 best_combo, best_sc = None, -999
@@ -485,7 +529,7 @@ def partition_into_5_games(pool_30, struct_pred, n_attempts=200, n_candidates=50
                     candidates = list(candidates)
 
                 for combo in candidates:
-                    sc = score_combination(tuple(combo), struct_pred)
+                    sc = score_combination(tuple(combo), struct_pred, pair_z, prev_nums, streaks)
                     if sc > best_sc:
                         best_sc = sc
                         best_combo = list(combo)
@@ -498,7 +542,7 @@ def partition_into_5_games(pool_30, struct_pred, n_attempts=200, n_candidates=50
                 else:
                     combo = sorted(remaining[:6])
                     partition.append(combo)
-                    total_score += score_combination(tuple(combo), struct_pred)
+                    total_score += score_combination(tuple(combo), struct_pred, pair_z, prev_nums, streaks)
                     remaining = remaining[6:]
 
         if len(partition) == 5 and total_score > best_total_score:
@@ -577,20 +621,35 @@ def train_and_save():
     struct_predictor.train(struct_df, total)
     struct_pred = struct_predictor.predict(struct_df, total)
 
-    # 앙상블
-    combined = 0.30 * xgb_probs + 0.30 * tf_probs + 0.20 * scorer_probs
+    # 앙상블 (TF 강화: Round 1 실험에서 E_tf_heavy가 상위)
+    combined = 0.25 * xgb_probs + 0.45 * tf_probs + 0.15 * scorer_probs
     combined = combined / combined.sum()
 
-    # 연속출현 감쇠 + cold pool
+    # 점수 조정 (스트릭 감쇠 제거)
     adjusted, cold_pool = apply_adjustments(combined, df, total)
 
-    # 풀 30개 선정
-    pool_30 = select_pool_30(adjusted, cold_pool)
-    excluded_15 = sorted(set(range(1, 46)) - set(pool_30))
-    cold_in_pool = len(set(pool_30) & cold_pool)
+    # 풀 35개 선정 (cold 강제 없음)
+    pool_35 = select_pool_35(adjusted, cold_pool)
+    excluded_10 = sorted(set(range(1, 46)) - set(pool_35))
+    cold_in_pool = len(set(pool_35) & cold_pool)
+
+    # 컨텍스트 정보 (페어점수, 이전회차, 연속출현 스트릭)
+    pair_z = build_pair_scores(df, total)
+    last_row = df.iloc[total - 1]
+    prev_nums = [int(last_row[c]) for c in ["n1", "n2", "n3", "n4", "n5", "n6"]]
+    streaks = {}
+    for num in range(1, 46):
+        streak = 0
+        for t in range(total - 1, -1, -1):
+            row = df.iloc[t]
+            if num in [row["n1"], row["n2"], row["n3"], row["n4"], row["n5"], row["n6"]]:
+                streak += 1
+            else:
+                break
+        streaks[num] = streak
 
     # 5게임 분할
-    games = partition_into_5_games(pool_30, struct_pred)
+    games = partition_into_5_games(pool_35, struct_pred, pair_z, prev_nums, streaks)
 
     # ── meta.json 저장 ──
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -603,10 +662,12 @@ def train_and_save():
         "struct_pred": {k: {"pred": round(float(v["pred"]), 4),
                             "std": round(float(v["std"]), 4)}
                         for k, v in struct_pred.items()},
-        "pool_30": pool_30,
-        "excluded_15": excluded_15,
+        "pool_35": pool_35,
+        "excluded_10": excluded_10,
         "cold_in_pool": cold_in_pool,
         "games": games,
+        "prev_nums": prev_nums,
+        "streaks": {str(k): v for k, v in streaks.items()},
     }
 
     meta_path = os.path.join(MODEL_DIR, "meta.json")
@@ -634,8 +695,8 @@ def train_and_save():
     print(f"\n{'=' * 60}")
     print(f"  {last_round + 1}회차 예측 (최대 커버리지)")
     print(f"{'=' * 60}")
-    print(f"\n  풀 30개: {pool_30}")
-    print(f"  제외 15개: {excluded_15}")
+    print(f"\n  풀 35개: {pool_35}")
+    print(f"  제외 10개: {excluded_10}")
     print(f"  cold 포함: {cold_in_pool}개")
     print(f"\n  5게임:")
     for i, g in enumerate(games, 1):

@@ -1,16 +1,16 @@
 """
 Walk-Forward OOS 백테스트
 ========================
-train_model.py의 전체 파이프라인(XGBoost+Transformer+Scorer+구조예측 → 30개 풀 → 5게임)을
+train_model.py의 전체 파이프라인(XGBoost+Transformer+Scorer+구조예측 → 35개 풀 → 5게임)을
 과거 데이터로 반복 검증.
 
 매 회차마다:
 1. t회차 이전 데이터로 학습 (retrain_interval마다 재학습)
-2. t회차 예측: 풀 30개 + 5게임 생성
+2. t회차 예측: 풀 35개 + 5게임 생성
 3. 실제 당첨번호와 비교
 
 평가 지표:
-- 풀 30개에 실제 번호 몇 개 포함? (기대: 4.0, 목표: 4.5+)
+- 풀 35개에 실제 번호 몇 개 포함? (기대: 4.67, 목표: 5.0+)
 - 5게임 중 최고 적중수 (2개 이상 = 가능성)
 - 5게임 전체 적중수 합계
 """
@@ -37,8 +37,8 @@ from train_model import (
     extract_structural_features,
     StructuralPredictor, NumberScorer, LottoTransformer,
     train_transformer, predict_transformer,
-    score_combination, apply_adjustments, select_pool_30,
-    partition_into_5_games,
+    score_combination, apply_adjustments, select_pool_35,
+    partition_into_5_games, build_pair_scores,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -139,26 +139,41 @@ def walk_forward_backtest(train_start=300, retrain_interval=50, verbose=True):
         # Number Scorer
         scorer_probs = scorer.score_numbers(df, t, current_regime)
 
-        # 앙상블
-        combined = 0.30 * xgb_probs + 0.30 * tf_probs + 0.20 * scorer_probs
+        # 앙상블 (TF 강화)
+        combined = 0.25 * xgb_probs + 0.45 * tf_probs + 0.15 * scorer_probs
         combined = combined / combined.sum()
 
         # Structural Predictor
         struct_pred = struct_predictor.predict(struct_df, t) if struct_predictor.models else {}
 
-        # 연속출현 감쇠 + cold pool
+        # 점수 조정 (스트릭 감쇠 제거)
         adjusted, cold_pool = apply_adjustments(combined, df.iloc[:t], t)
 
-        # 풀 30개
-        pool_30 = select_pool_30(adjusted, cold_pool)
+        # 풀 35개 (cold 강제 없음)
+        pool_35 = select_pool_35(adjusted, cold_pool)
 
         # 5게임 분할 (빠른 버전)
         if struct_pred:
-            games = partition_into_5_games(pool_30, struct_pred,
+            # 컨텍스트 정보 계산
+            pair_z = build_pair_scores(df, t)
+            last_row = df.iloc[t - 1]
+            prev_nums = [int(last_row[c]) for c in ["n1", "n2", "n3", "n4", "n5", "n6"]]
+            bt_streaks = {}
+            for num in range(1, 46):
+                streak = 0
+                for tt in range(t - 1, -1, -1):
+                    row = df.iloc[tt]
+                    if num in [row["n1"], row["n2"], row["n3"], row["n4"], row["n5"], row["n6"]]:
+                        streak += 1
+                    else:
+                        break
+                bt_streaks[num] = streak
+
+            games = partition_into_5_games(pool_35, struct_pred, pair_z, prev_nums, bt_streaks,
                                            n_attempts=30, n_candidates=100)
         else:
             # struct_pred 없으면 랜덤 파티션
-            p = list(pool_30)
+            p = list(pool_35)
             np.random.shuffle(p)
             games = [sorted(p[i*6:(i+1)*6]) for i in range(5)]
 
@@ -168,19 +183,19 @@ def walk_forward_backtest(train_start=300, retrain_interval=50, verbose=True):
             actual.add(int(df.iloc[t][col]))
 
         # ── 평가 ──
-        pool_hits = len(actual & set(pool_30))
+        pool_hits = len(actual & set(pool_35))
         game_hits = [len(actual & set(g)) for g in games]
         best_game_hits = max(game_hits)
         total_hits = sum(game_hits)
 
         result = {
             "round": round_num,
-            "pool_hits": pool_hits,       # 풀 30개 중 실제 포함 수
+            "pool_hits": pool_hits,       # 풀 35개 중 실제 포함 수
             "game_hits": game_hits,       # 각 게임별 적중 수
             "best_game": best_game_hits,  # 최고 적중 게임
             "total_hits": total_hits,     # 5게임 총 적중
             "actual": sorted(actual),
-            "pool_30": pool_30,
+            "pool_35": pool_35,
         }
         results.append(result)
 
@@ -208,8 +223,8 @@ def walk_forward_backtest(train_start=300, retrain_interval=50, verbose=True):
     print(f"  Walk-Forward 백테스트 결과 ({n}회)")
     print(f"{'=' * 70}")
 
-    # 풀 30개 적중률
-    print(f"\n  ■ 풀 30개 적중 (랜덤 기대: 4.00/6)")
+    # 풀 35개 적중률
+    print(f"\n  ■ 풀 35개 적중 (랜덤 기대: 4.67/6)")
     print(f"    평균: {np.mean(pool_hits_all):.3f}/6")
     print(f"    분포: ", end="")
     for h in range(7):
@@ -248,9 +263,9 @@ def walk_forward_backtest(train_start=300, retrain_interval=50, verbose=True):
     random_4plus = 0.00484 * n  # 랜덤 5게임으로 4등+ 기대 횟수
     actual_4plus = prize_counts.get(4, 0) + prize_counts.get(5, 0) + prize_counts.get(6, 0)
     print(f"\n  ■ 랜덤 대비")
-    print(f"    풀 적중: {np.mean(pool_hits_all):.3f} vs 랜덤 4.000 "
-          f"({'↑' if np.mean(pool_hits_all) > 4.0 else '↓'} "
-          f"{abs(np.mean(pool_hits_all) - 4.0) / 4.0 * 100:.1f}%)")
+    print(f"    풀 적중: {np.mean(pool_hits_all):.3f} vs 랜덤 4.667 "
+          f"({'\u2191' if np.mean(pool_hits_all) > 4.667 else '\u2193'} "
+          f"{abs(np.mean(pool_hits_all) - 4.667) / 4.667 * 100:.1f}%)")
     print(f"    4등+ 횟수: AI {actual_4plus}회 vs 랜덤 기대 {random_4plus:.1f}회 "
           f"({'↑' if actual_4plus > random_4plus else '↓'} "
           f"{actual_4plus / max(random_4plus, 0.1):.1f}배)")
