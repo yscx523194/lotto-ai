@@ -20,3 +20,8 @@ test_api2.py
 # OS
 Thumbs.db
 .DS_Store
+
+# Web
+web/frontend/node_modules/
+web/backend/node_modules/
+web/backend/data/

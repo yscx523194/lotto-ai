@@ -13,68 +13,103 @@ sys.path.insert(0, os.path.join(BASE_DIR, "lotto", "src"))
 
 from lotto_smart import (
     load_data, build_structural_df, detect_regimes,
-    StructuralPredictor, NumberScorer,
+    StructuralPredictor, NumberScorer, LottoTransformer,
     train_transformer, predict_transformer, smart_select,
 )
+import torch
 import xgboost as xgb
+
+PREDICTION_V2_PATH = os.path.join(BASE_DIR, "models_v2", "prediction_v2.json")
+PURCHASE_GAMES_PATH = os.path.join(BASE_DIR, "models_v2", "purchase_games.json")
 
 
 def generate_5_games():
-    """Smart v2로 5게임 예측 생성"""
+    """Smart v2로 5게임 예측 생성. 저장된 모델/예측이 있으면 로드하여 빠르게 실행."""
     print("=" * 60)
     print("  5게임 예측 번호 생성 중...")
     print("=" * 60)
 
     df = load_data()
     total = len(df)
-    binary_matrix = np.zeros((total, 45), dtype=np.float32)
-    for i, row in df.iterrows():
-        for col in ["n1", "n2", "n3", "n4", "n5", "n6"]:
-            binary_matrix[i, row[col] - 1] = 1.0
+    last_round = int(df.iloc[-1]["round"])
 
-    struct_df = build_structural_df(df)
-    regimes = detect_regimes(struct_df)
-    current_regime = max(r for r in regimes if r < total)
+    # 저장된 예측 결과가 최신이면 바로 사용
+    if os.path.exists(PURCHASE_GAMES_PATH):
+        with open(PURCHASE_GAMES_PATH, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("target_round") == last_round + 1:
+            print(f"  저장된 예측 로드 (대상: {last_round + 1}회차)")
+            games = saved["games"]
+            print(f"\n  {last_round + 1}회차 예측 5게임:")
+            print(f"  {'─' * 50}")
+            for i, nums in enumerate(games):
+                total_sum = sum(nums)
+                odd = sum(1 for n in nums if n % 2 == 1)
+                print(f"  게임 {i+1}: {nums}  합={total_sum} 홀={odd} 짝={6-odd}")
+            return games, last_round + 1
 
-    # XGBoost
-    print("  XGBoost 학습...")
-    regime_data = binary_matrix[current_regime:total]
-    X_xgb, y_xgb = [], []
-    for i in range(30, len(regime_data)):
-        X_xgb.append(regime_data[i - 20:i].flatten())
-        y_xgb.append(regime_data[i])
-    X_xgb = np.array(X_xgb)
-    y_xgb = np.array(y_xgb)
+    # 저장된 prediction_v2.json에서 확률 로드 시도
+    probs_loaded = False
+    if os.path.exists(PREDICTION_V2_PATH):
+        with open(PREDICTION_V2_PATH, "r", encoding="utf-8") as f:
+            pred_v2 = json.load(f)
+        if pred_v2.get("target_round") == last_round + 1:
+            print(f"  저장된 확률 모델 로드 (대상: {last_round + 1}회차)")
+            combined = np.array([pred_v2["probabilities"][str(i)] for i in range(1, 46)])
+            combined = combined / combined.sum()
+            probs_loaded = True
 
-    xgb_models = []
-    for num in range(45):
-        m = xgb.XGBClassifier(
-            n_estimators=150, max_depth=5, learning_rate=0.05,
-            scale_pos_weight=39/6, verbosity=0, random_state=42
-        )
-        m.fit(X_xgb, y_xgb[:, num])
-        xgb_models.append(m)
+    if not probs_loaded:
+        # 저장된 모델이 없거나 오래됨 → 학습 실행
+        binary_matrix = np.zeros((total, 45), dtype=np.float32)
+        for i, row in df.iterrows():
+            for col in ["n1", "n2", "n3", "n4", "n5", "n6"]:
+                binary_matrix[i, row[col] - 1] = 1.0
 
-    seq = binary_matrix[total - 20:total].flatten().reshape(1, -1)
-    xgb_probs = np.array([m.predict_proba(seq)[0, 1] for m in xgb_models])
+        struct_df = build_structural_df(df)
+        regimes = detect_regimes(struct_df)
+        current_regime = max(r for r in regimes if r < total)
 
-    # Transformer
-    print("  Transformer 학습...")
-    tf_model = train_transformer(binary_matrix, total, seq_len=30, epochs=50)
-    tf_probs = predict_transformer(tf_model, binary_matrix, total, seq_len=30)
+        # XGBoost
+        print("  XGBoost 학습...")
+        regime_data = binary_matrix[current_regime:total]
+        X_xgb, y_xgb = [], []
+        for i in range(30, len(regime_data)):
+            X_xgb.append(regime_data[i - 20:i].flatten())
+            y_xgb.append(regime_data[i])
+        X_xgb = np.array(X_xgb)
+        y_xgb = np.array(y_xgb)
 
-    # Number Scorer
-    scorer = NumberScorer()
-    scorer_probs = scorer.score_numbers(df, total, current_regime)
+        xgb_models = []
+        for num in range(45):
+            m = xgb.XGBClassifier(
+                n_estimators=150, max_depth=5, learning_rate=0.05,
+                scale_pos_weight=39/6, verbosity=0, random_state=42
+            )
+            m.fit(X_xgb, y_xgb[:, num])
+            xgb_models.append(m)
 
-    # Structural Predictor
+        seq = binary_matrix[total - 20:total].flatten().reshape(1, -1)
+        xgb_probs = np.array([m.predict_proba(seq)[0, 1] for m in xgb_models])
+
+        # Transformer
+        print("  Transformer 학습...")
+        tf_model = train_transformer(binary_matrix, total, seq_len=30, epochs=50)
+        tf_probs = predict_transformer(tf_model, binary_matrix, total, seq_len=30)
+
+        # Number Scorer
+        scorer = NumberScorer()
+        scorer_probs = scorer.score_numbers(df, total, current_regime)
+
+        # 앙상블
+        combined = 0.30 * xgb_probs + 0.30 * tf_probs + 0.20 * scorer_probs
+        combined = combined / combined.sum()
+
+    # Structural Predictor (항상 필요 - 경량 연산)
+    struct_df = build_structural_df(df) if not probs_loaded else build_structural_df(df)
     struct_predictor = StructuralPredictor()
     struct_predictor.train(struct_df, total)
     struct_pred = struct_predictor.predict(struct_df, total)
-
-    # 앙상블
-    combined = 0.30 * xgb_probs + 0.30 * tf_probs + 0.20 * scorer_probs
-    combined = combined / combined.sum()
 
     # 5게임 선택
     top_combos = smart_select(combined, struct_pred, n_candidates=50000, top_n=5,
