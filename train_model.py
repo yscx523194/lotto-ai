@@ -14,6 +14,7 @@
 import os
 import sys
 import json
+import pickle
 import numpy as np
 import pandas as pd
 from itertools import combinations
@@ -598,7 +599,24 @@ def train_and_save():
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"\n  저장 완료: {meta_path}")
+    # ── 모델 파일 저장 ──
+    # XGBoost 45개 모델
+    for i, m in enumerate(xgb_models):
+        m.save_model(os.path.join(MODEL_DIR, f"xgb_{i:02d}.json"))
+
+    # Transformer
+    if tf_model is not None:
+        torch.save(tf_model.state_dict(), os.path.join(MODEL_DIR, "transformer.pt"))
+
+    # Structural Predictor
+    with open(os.path.join(MODEL_DIR, "struct_predictor.pkl"), "wb") as f:
+        pickle.dump(struct_predictor, f)
+
+    print(f"\n  저장 완료: {MODEL_DIR}/")
+    print(f"    - meta.json (캐시 점수/풀)")
+    print(f"    - xgb_00~44.json (XGBoost 45개)")
+    print(f"    - transformer.pt (Transformer)")
+    print(f"    - struct_predictor.pkl (구조 예측)")
     print(f"\n{'=' * 60}")
     print(f"  {last_round + 1}회차 예측 (최대 커버리지)")
     print(f"{'=' * 60}")
