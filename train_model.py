@@ -361,18 +361,32 @@ def score_combination(combo, struct_pred):
         elif n <= 39: decades[3] += 1
         else: decades[4] += 1
 
-    # 하드 필터
-    if total_sum < 90 or total_sum > 200: return -100.0
-    if odd_count <= 0 or odd_count >= 6: return -100.0
-    if ac_value <= 4: return -100.0
-    if max_same_ending >= 4: return -100.0
-    if prime_count >= 5: return -100.0
+    span = nums[5] - nums[0]
+    has_quad = any(nums[i+1]-nums[i]==1 and nums[i+2]-nums[i+1]==1 and nums[i+3]-nums[i+2]==1 for i in range(3))
+    mult3_count = sum(1 for n in nums if n % 3 == 0)
+    max_decade = max(decades)
 
-    # 소프트 필터
+    # 하드 필터 (데이터 분석 기반 — 출현율 5% 미만)
+    if total_sum < 90 or total_sum > 200: return -100.0      # 7.9%
+    if odd_count <= 0 or odd_count >= 6: return -100.0       # 2.9%
+    if ac_value <= 4: return -100.0                          # 2.5%
+    if max_same_ending >= 4: return -100.0                   # 0.4%
+    if prime_count >= 5: return -100.0                       # 0.7%
+    if has_quad: return -100.0                               # 0.5% (4연번)
+    if span < 20: return -100.0                              # 4.7%
+    if high_count == 0 or high_count == 6: return -100.0     # 2.6% (올고/올저)
+    if nums[0] >= 15: return -100.0                          # 9.4% (최소번호 15+)
+    if nums[5] <= 35: return -100.0                          # 19.6% (최대번호 35-)
+
+    # 소프트 필터 (감점)
     log_prob = 0.0
-    if has_triple: log_prob -= 1.5
-    if odd_count == 1 or odd_count == 5: log_prob -= 0.5
-    if consec_count >= 3: log_prob -= 1.0
+    if has_triple: log_prob -= 1.5                           # 5.4% (3연번)
+    if odd_count == 1 or odd_count == 5: log_prob -= 0.5     # 14.7%
+    if consec_count >= 3: log_prob -= 1.0                    # 1.8%
+    if max_decade >= 4: log_prob -= 1.0                      # 5.8% (한 구간 4개+)
+    if unique_endings <= 3: log_prob -= 1.0                  # 3.8%
+    if mult3_count == 0 or mult3_count >= 5: log_prob -= 0.5 # 8.4%
+    if total_sum < 100 or total_sum > 170: log_prob -= 0.3   # 26.8% (타이트 범위)
 
     checks = {
         "sum": total_sum, "odd_count": odd_count, "high_count": high_count,
