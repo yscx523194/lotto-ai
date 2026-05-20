@@ -37,7 +37,7 @@ function writeHistory(data) {
 }
 
 function runPython(script, args = []) {
-  return execFileAsync('python', [script, ...args], {
+  return execFileAsync('python3', [script, ...args], {
     cwd: LOTTO_SRC,
     timeout: 120_000,
     env: { ...process.env, HEADLESS: 'true' },
@@ -134,14 +134,27 @@ app.post('/api/purchase', async (req, res) => {
     const envPath = join(LOTTO_ROOT, 'lotto', '.env');
     writeFileSync(envPath, `USER_ID=${userId}\nPASSWD=${password}\n`);
 
-    // 1. Load predictions from lotto_models/meta.json
+    // 1. Generate fresh prediction (each user gets unique numbers)
     const metaPath = join(LOTTO_ROOT, 'lotto_models', 'meta.json');
-    let games;
-    if (existsSync(metaPath)) {
-      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
-      games = meta.games;
-    } else {
+    if (!existsSync(metaPath)) {
       return res.status(500).json({ error: '예측 모델이 준비되지 않았습니다. 학습을 먼저 진행하세요.' });
+    }
+
+    let games;
+    try {
+      const { stdout: predOut } = await execFileAsync('python3', [
+        '-c',
+        'import sys, json; sys.path.insert(0, r"' + LOTTO_ROOT.replace(/\\/g, '\\\\') + '"); from predict_fast import predict; r = predict(); print("__RESULT__", json.dumps(r["games"], ensure_ascii=False))',
+      ], { cwd: LOTTO_ROOT, timeout: 30_000 });
+      const predMatch = predOut.match(/__RESULT__\s*(\[.*\])/);
+      if (predMatch) {
+        games = JSON.parse(predMatch[1]);
+      } else {
+        return res.status(500).json({ error: '예측 번호 생성에 실패했습니다.' });
+      }
+    } catch (predErr) {
+      console.error('Prediction error:', predErr.message);
+      return res.status(500).json({ error: '예측 번호 생성 중 오류가 발생했습니다.' });
     }
 
     // 2. Run purchase via lotto645.py
@@ -224,7 +237,7 @@ if added > 0:
     save_cache(cache)
 print(json.dumps({"added": added, "latest": max(int(k) for k in cache.keys())}, ensure_ascii=False))
 `.trim();
-    const { stdout } = await execFileAsync('python', ['-c', script], {
+    const { stdout } = await execFileAsync('python3', ['-c', script], {
       cwd: LOTTO_ROOT,
       timeout: 30_000,
       env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
@@ -243,7 +256,7 @@ print(json.dumps({"added": added, "latest": max(int(k) for k in cache.keys())}, 
 // Refresh prediction using saved model (predict_fast.py)
 app.post('/api/prediction/refresh', async (_req, res) => {
   try {
-    const { stdout } = await execFileAsync('python', [
+    const { stdout } = await execFileAsync('python3', [
       '-c',
       'import sys, json; sys.path.insert(0, r"' + LOTTO_ROOT.replace(/\\/g, '\\\\') + '"); from predict_fast import predict; r = predict(); print("__RESULT__", json.dumps(r, ensure_ascii=False))',
     ], { cwd: LOTTO_ROOT, timeout: 30_000 });
@@ -325,7 +338,7 @@ app.get('/api/model/status', (_req, res) => {
 // Train model
 app.post('/api/model/train', async (_req, res) => {
   try {
-    const { stdout } = await execFileAsync('python', [
+    const { stdout } = await execFileAsync('python3', [
       join(LOTTO_ROOT, 'train_model.py'),
     ], {
       cwd: LOTTO_ROOT,

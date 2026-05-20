@@ -61,8 +61,30 @@ def parse_arguments():
     # Parse command-line arguments
     args = sys.argv[1:]
     
-    # Case 1: Single argument (auto games by amount)
+    # Case 1: Single argument (auto games by amount OR JSON games array)
     if len(args) == 1:
+        # Try JSON first (e.g. '[[1,2,3,4,5,6],[7,8,9,10,11,12]]')
+        try:
+            parsed = json.loads(args[0])
+            if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], list):
+                # Validate each game
+                for i, game in enumerate(parsed):
+                    if len(game) != 6:
+                        print(f"Error: Game {i+1} must have exactly 6 numbers, got {len(game)}")
+                        sys.exit(1)
+                    if not all(isinstance(n, int) and 1 <= n <= 45 for n in game):
+                        print(f"Error: Game {i+1} numbers must be integers between 1 and 45")
+                        sys.exit(1)
+                    if len(game) != len(set(game)):
+                        print(f"Error: Game {i+1} contains duplicate numbers")
+                        sys.exit(1)
+                print(f"JSON mode: {len(parsed)} game(s)")
+                for i, game in enumerate(parsed):
+                    print(f"  Game {i+1}: {sorted(game)}")
+                return 0, parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
         amount_str = args[0].replace(',', '')  # Remove commas
         try:
             amount = int(amount_str)
